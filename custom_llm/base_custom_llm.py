@@ -1,31 +1,33 @@
 """
 base_custom_llm.py
 ──────────────────
-Example custom LangChain LLMs that you can replace with your own implementation.
+Example custom LangChain LLMs. Replace the _generate / _call body with
+your own backend. The shell (config, error handling, SSL, kwargs routing)
+is already wired up.
 
-Two patterns are shown:
+Two patterns
+────────────
+1. CustomChatLLM  (BaseChatModel) — RECOMMENDED
+   • invoke() returns AIMessage
+   • Tools are received via _generate(messages, **kwargs) → kwargs["tools"]
+   • Works natively with LangChainADKBridge (native kwargs path)
 
-  1. CustomChatLLM  (extends BaseChatModel) — RECOMMENDED
-     ✅ Native tool/function-calling support via bind_tools
-     ✅ Returns AIMessage with tool_calls
-     ✅ Works best with LangChainADKBridge
+2. CustomTextLLM  (LLM) — plain text completion
+   • invoke() returns str
+   • Tools are injected into the system prompt by the bridge (prompt path)
+   • Simpler but the model must emit JSON tool-call blocks
 
-  2. CustomTextLLM  (extends LLM) — simpler but limited
-     ⚠️ Text completion only — tool calls injected via system prompt
-     ⚠️ Requires the model to output JSON function-call blocks
-     ✅ Works with LangChainADKBridge via system-prompt injection
-
-Replace the _call / _generate bodies with your own LLM backend logic.
+IMPORTANT: To plug in YOUR OWN LLM, edit agent.py — not this file.
+           This file is just a working reference implementation.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Iterator, List, Optional
+from typing import Any, List, Optional
 
 import requests
 
-# ── LangChain base classes ──────────────────────────────────────────────────
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.llms import LLM
 from langchain_core.messages import (
@@ -33,41 +35,46 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
-from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
+from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pattern 1 — BaseChatModel (RECOMMENDED for tool calling)
+# Pattern 1 — BaseChatModel  (RECOMMENDED)
 # ═══════════════════════════════════════════════════════════════════════════
 class CustomChatLLM(BaseChatModel):
     """
-    A custom chat LLM that calls an OpenAI-compatible HTTP endpoint.
+    Custom chat LLM calling any OpenAI-compatible /v1/chat/completions endpoint.
 
-    Swap out _generate with your own backend (local model, proprietary API, etc.).
-
-    Example (Ollama):
+    Quick setup
+    ───────────
         llm = CustomChatLLM(
-            base_url="http://localhost:11434/v1",
+            base_url="http://localhost:11434/v1",   # Ollama, vLLM, LM Studio …
             model_name="llama3.2",
-            api_key="ollama",
+            api_key="custom",                       # any string for keyless servers
         )
 
-    Example (any OpenAI-compatible server):
-        llm = CustomChatLLM(
-            base_url="http://my-server:8000/v1",
-            model_name="my-model",
-            api_key="secret",
-        )
+    Tool calling
+    ────────────
+    When the ADK bridge calls llm.invoke(messages, tools=[...]), the
+    ``tools`` kwarg lands in _generate(**kwargs). It is forwarded to the
+    OpenAI-format request automatically. If your server does not support
+    function calling, the bridge will catch the error and fall back to
+    prompt injection — no action needed on your part.
     """
 
-    base_url: str = Field(default="http://localhost:11434/v1")
-    model_name: str = Field(default="llama3.2")
-    api_key: str = Field(default="custom")
-    temperature: float = Field(default=0.7)
-    max_tokens: int = Field(default=2048)
-    timeout: int = Field(default=120)
+    base_url: str    = Field(default="http://localhost:11434/v1")
+    model_name: str  = Field(default="llama3.2")
+    api_key: str     = Field(default="custom")
+    temperature: float = Field(default=0.3)
+    max_tokens: int  = Field(default=2048)
+    timeout: int     = Field(default=120)
+    ssl_verify: bool = Field(
+        default=True,
+        description="Set to False to skip TLS verification (self-signed certs).",
+    )
 
     @property
     def _llm_type(self) -> str:
@@ -80,25 +87,30 @@ class CustomChatLLM(BaseChatModel):
             return {"role": "system", "content": msg.content}
         if isinstance(msg, HumanMessage):
             return {"role": "user", "content": msg.content}
+        if isinstance(msg, ToolMessage):
+            return {
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id,
+                "content": msg.content,
+            }
         if isinstance(msg, AIMessage):
             d: dict = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
                 d["tool_calls"] = [
                     {
-                        "id": tc.get("id", tc["name"]),
-                        "type": "function",
+                        "id":       tc.get("id", tc["name"]),
+                        "type":     "function",
                         "function": {
-                            "name": tc["name"],
+                            "name":      tc["name"],
                             "arguments": json.dumps(tc.get("args", {})),
                         },
                     }
                     for tc in msg.tool_calls
                 ]
             return d
-        # ToolMessage / generic
         return {"role": "user", "content": str(msg.content)}
 
-    # ── Core generation (sync) ─────────────────────────────────────────────
+    # ── Core generation ────────────────────────────────────────────────────
     def _generate(
         self,
         messages: List[BaseMessage],
@@ -108,39 +120,75 @@ class CustomChatLLM(BaseChatModel):
     ) -> ChatResult:
         """
         ─────────────────────────────────────────────────────────────
-        REPLACE THIS BODY with your own model invocation.
+        REPLACE THIS BODY with your own model invocation if needed.
+        Most OpenAI-compatible servers will work without any changes.
         ─────────────────────────────────────────────────────────────
         """
-        payload: dict = {
-            "model": self.model_name,
-            "messages": [self._msg_to_openai(m) for m in messages],
+        payload: dict[str, Any] = {
+            "model":       self.model_name,
+            "messages":    [self._msg_to_openai(m) for m in messages],
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens":  self.max_tokens,
         }
+        if stop:
+            payload["stop"] = stop
 
-        # Forward tool schemas if bound (passed via kwargs by bind_tools)
-        if tools := kwargs.get("tools"):
-            payload["tools"] = tools
+        # ── Forward tool schemas when provided (OpenAI format) ────
+        # The bridge passes these as: llm.invoke(messages, tools=[...])
+        # which flows into _generate via **kwargs
+        tools = kwargs.get("tools")
+        if tools:
+            payload["tools"]       = tools
             payload["tool_choice"] = "auto"
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
+            "Content-Type":  "application/json",
         }
 
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+                verify=self.ssl_verify,
+            )
+        except requests.exceptions.SSLError as exc:
+            raise RuntimeError(
+                f"SSL certificate error connecting to {self.base_url}. "
+                f"Set ssl_verify=False in CustomChatLLM to skip verification.\n"
+                f"Original error: {exc}"
+            ) from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot connect to {self.base_url}. "
+                f"Is your LLM server running?\nOriginal error: {exc}"
+            ) from exc
+        except requests.exceptions.Timeout:
+            raise RuntimeError(
+                f"Request to {self.base_url} timed out after {self.timeout}s. "
+                f"Increase the timeout= parameter."
+            )
 
-        choice = data["choices"][0]["message"]
-        text = choice.get("content") or ""
+        if not resp.ok:
+            raise RuntimeError(
+                f"LLM server returned HTTP {resp.status_code}.\n"
+                f"URL    : {self.base_url}/chat/completions\n"
+                f"Body   : {resp.text[:600]}"
+            )
 
-        # Parse tool calls (OpenAI format)
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not parse JSON from LLM response: {resp.text[:400]}"
+            ) from exc
+
+        choice = data.get("choices", [{}])[0].get("message", {})
+        text   = choice.get("content") or ""
+
+        # ── Parse tool_calls (OpenAI format) ───────────────────────
         tool_calls = []
         for tc in choice.get("tool_calls") or []:
             fn = tc.get("function", {})
@@ -148,14 +196,12 @@ class CustomChatLLM(BaseChatModel):
                 args = json.loads(fn.get("arguments", "{}"))
             except json.JSONDecodeError:
                 args = {}
-            tool_calls.append(
-                {
-                    "name": fn.get("name", ""),
-                    "args": args,
-                    "id": tc.get("id", fn.get("name", "")),
-                    "type": "tool_call",
-                }
-            )
+            tool_calls.append({
+                "name": fn.get("name", ""),
+                "args": args,
+                "id":   tc.get("id", fn.get("name", "")),
+                "type": "tool_call",
+            })
 
         ai_msg = AIMessage(content=text, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_msg)])
@@ -166,27 +212,22 @@ class CustomChatLLM(BaseChatModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pattern 2 — Plain LLM (text completion style)
+# Pattern 2 — Plain LLM  (text completion)
 # ═══════════════════════════════════════════════════════════════════════════
 class CustomTextLLM(LLM):
     """
-    A custom text-completion LLM.
+    Custom text-completion LLM (e.g. Ollama /api/generate endpoint).
 
     Tool calling is handled via system-prompt injection by LangChainADKBridge.
-    The model must output JSON blocks as instructed (see bridge.py).
-
-    Example (Ollama generate endpoint):
-        llm = CustomTextLLM(
-            base_url="http://localhost:11434",
-            model_name="llama3.2",
-        )
+    The model must output JSON blocks as described in the injected instructions.
     """
 
-    base_url: str = Field(default="http://localhost:11434")
+    base_url: str   = Field(default="http://localhost:11434")
     model_name: str = Field(default="llama3.2")
-    temperature: float = Field(default=0.7)
+    temperature: float = Field(default=0.3)
     max_tokens: int = Field(default=2048)
-    timeout: int = Field(default=120)
+    timeout: int    = Field(default=120)
+    ssl_verify: bool = Field(default=True)
 
     @property
     def _llm_type(self) -> str:
@@ -204,8 +245,8 @@ class CustomTextLLM(LLM):
         REPLACE THIS BODY with your own text generation logic.
         ─────────────────────────────────────────────────────────────
         """
-        payload = {
-            "model": self.model_name,
+        payload: dict[str, Any] = {
+            "model":  self.model_name,
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -214,14 +255,28 @@ class CustomTextLLM(LLM):
             },
         }
 
-        resp = requests.post(
-            f"{self.base_url}/api/generate",
-            json=payload,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "")
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                timeout=self.timeout,
+                verify=self.ssl_verify,
+            )
+        except requests.exceptions.SSLError as exc:
+            raise RuntimeError(
+                f"SSL error. Set ssl_verify=False in CustomTextLLM.\n{exc}"
+            ) from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot connect to {self.base_url}. Is the server running?\n{exc}"
+            ) from exc
+
+        if not resp.ok:
+            raise RuntimeError(
+                f"HTTP {resp.status_code} from {self.base_url}: {resp.text[:400]}"
+            )
+
+        return resp.json().get("response", "")
 
     @property
     def _identifying_params(self) -> dict:

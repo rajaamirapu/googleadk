@@ -4,11 +4,20 @@ adk_langchain_bridge.py
 Bridges ANY LangChain LLM (LLM or BaseChatModel) into Google ADK's
 BaseLlm interface so it can power an ADK Agent directly.
 
-Supports:
-  ✅ Plain LangChain LLM  (text completion — tool calls via system-prompt injection)
-  ✅ LangChain BaseChatModel  (native bind_tools / tool_calls)
-  ✅ Async (ainvoke) and sync (invoke) LLMs
-  ✅ Streaming (yields a single final LlmResponse)
+Root-cause notes
+────────────────
+• BaseChatModel.bind_tools() raises NotImplementedError unless the subclass
+  overrides it (ChatOpenAI does, a plain custom class usually does NOT).
+• This bridge NEVER calls bind_tools() blindly. Instead it:
+    1. Tries passing tools as kwargs to ainvoke/invoke   (native path)
+    2. Falls back to system-prompt injection + JSON parsing  (prompt path)
+
+Supported LLM styles
+─────────────────────
+  ✅ BaseChatModel with tools via kwargs  (native tool_calls in AIMessage)
+  ✅ BaseChatModel without tool support   (falls back to prompt injection)
+  ✅ Plain LLM (text completion)          (always uses prompt injection)
+  ✅ Sync and Async LLMs
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import traceback as tb_module
 from typing import Any, AsyncGenerator, Optional
 
 from google.adk.models.base_llm import BaseLlm
@@ -25,7 +35,6 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 from pydantic import ConfigDict
 
-# LangChain message types
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -52,7 +61,7 @@ _TYPE_MAP = {
 
 
 def _schema_to_dict(schema: Any) -> dict:
-    """Convert a google.genai Schema (or dict) to a JSON Schema dict."""
+    """Convert a google.genai Schema (or dict) to a plain JSON Schema dict."""
     if schema is None:
         return {"type": "object", "properties": {}}
     if isinstance(schema, dict):
@@ -60,7 +69,6 @@ def _schema_to_dict(schema: Any) -> dict:
 
     result: dict = {}
 
-    # Type
     raw_type = getattr(schema, "type", None)
     if raw_type is not None:
         type_str = raw_type.name if hasattr(raw_type, "name") else str(raw_type)
@@ -90,7 +98,7 @@ def _schema_to_dict(schema: Any) -> dict:
 # Helper: extract FunctionDeclaration list from LlmRequest
 # ─────────────────────────────────────────────────────────────
 def _extract_function_declarations(llm_request: LlmRequest) -> list[dict]:
-    """Return a list of {name, description, parameters} dicts from the request."""
+    """Return [{name, description, parameters}, ...] from the request tools."""
     decls: list[dict] = []
     if not (llm_request.config and llm_request.config.tools):
         return decls
@@ -109,12 +117,20 @@ def _extract_function_declarations(llm_request: LlmRequest) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
+# Helper: build OpenAI-format tool list for kwargs passing
+# ─────────────────────────────────────────────────────────────
+def _to_openai_tools(decls: list[dict]) -> list[dict]:
+    """Wrap function declarations in OpenAI tool schema format."""
+    return [{"type": "function", "function": d} for d in decls]
+
+
+# ─────────────────────────────────────────────────────────────
 # Helper: build tool-call injection text for plain LLMs
 # ─────────────────────────────────────────────────────────────
 def _build_tool_system_suffix(decls: list[dict]) -> str:
     """
-    When the LLM has no native tool-calling support, describe the tools
-    in the system prompt and ask the model to emit JSON function calls.
+    Describe tools in the system prompt and instruct the model to emit
+    a JSON function-call block when it wants to call a tool.
     """
     if not decls:
         return ""
@@ -124,21 +140,21 @@ def _build_tool_system_suffix(decls: list[dict]) -> str:
 
 ## Available Tools
 You have access to the following tools. When you want to call a tool, respond
-with a JSON block (and nothing else in that turn) using this exact format:
+ONLY with a JSON block in the format below (nothing else in that turn):
 
 ```json
 {{
   "function_call": {{
     "name": "<tool_name>",
-    "arguments": {{ "<param>": <value>, ... }}
+    "arguments": {{ "<param>": <value> }}
   }}
 }}
 ```
 
-### Tool definitions
+Tool definitions:
 {tools_json}
 
-After receiving the tool result, continue your answer normally.
+After receiving the tool result in a follow-up message, continue your answer.
 """
 
 
@@ -146,31 +162,64 @@ After receiving the tool result, continue your answer normally.
 # Helper: parse JSON tool call from plain-LLM text output
 # ─────────────────────────────────────────────────────────────
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-_BARE_JSON_RE = re.compile(r"(\{[^{}]*\"function_call\"[^{}]*\})", re.DOTALL)
+
+
+def _extract_balanced_json(text: str, start: int) -> Optional[str]:
+    """
+    Extract a balanced JSON object starting at `start` index in `text`.
+    Handles arbitrary nesting — regex alone can't do this correctly.
+    """
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
 def _parse_tool_call_from_text(text: str) -> Optional[tuple[str, dict]]:
-    """
-    Try to extract a function_call JSON from plain text.
-    Returns (name, args) or None.
-    """
-    # Try fenced code block first
+    """Extract (name, args) from a JSON function-call block in plain text."""
+    # 1. Fenced code block  ```json { ... } ```
     m = _JSON_BLOCK_RE.search(text)
-    if not m:
-        m = _BARE_JSON_RE.search(text)
-    if not m:
-        return None
+    if m:
+        candidate = m.group(1)
+    else:
+        # 2. Bare JSON — find first { that contains "function_call"
+        idx = text.find('{"function_call"')
+        if idx == -1:
+            idx = text.find('{ "function_call"')
+        if idx == -1:
+            return None
+        candidate = _extract_balanced_json(text, idx)
+        if not candidate:
+            return None
 
     try:
-        obj = json.loads(m.group(1))
-        fc = obj.get("function_call", {})
+        obj  = json.loads(candidate)
+        fc   = obj.get("function_call", {})
         name = fc.get("name")
         args = fc.get("arguments", fc.get("args", {}))
         if name:
             return name, args
     except json.JSONDecodeError:
         pass
-
     return None
 
 
@@ -182,10 +231,9 @@ def _adk_contents_to_langchain(
     system_instruction: str = "",
     tool_suffix: str = "",
 ) -> list[BaseMessage]:
-    """Convert ADK Content list to a list of LangChain BaseMessages."""
+    """Convert an ADK Content list + system instruction to LangChain messages."""
     messages: list[BaseMessage] = []
 
-    # System message (instruction + optional tool descriptions)
     full_system = (system_instruction or "").strip()
     if tool_suffix:
         full_system = full_system + tool_suffix
@@ -193,28 +241,21 @@ def _adk_contents_to_langchain(
         messages.append(SystemMessage(content=full_system))
 
     for content in contents:
-        role = content.role
+        role  = content.role
         parts = content.parts or []
 
         fn_responses = [p for p in parts if getattr(p, "function_response", None)]
-        fn_calls = [p for p in parts if getattr(p, "function_call", None)]
-        text_parts = [p for p in parts if getattr(p, "text", None)]
+        fn_calls     = [p for p in parts if getattr(p, "function_call",     None)]
+        text_parts   = [p for p in parts if getattr(p, "text",              None)]
 
         if role == "user":
             if fn_responses:
-                # Tool results → ToolMessage
                 for p in fn_responses:
-                    fr = p.function_response
+                    fr  = p.function_response
                     raw = fr.response
-                    content_str = (
-                        json.dumps(raw) if isinstance(raw, dict) else str(raw)
-                    )
+                    content_str = json.dumps(raw) if isinstance(raw, dict) else str(raw)
                     messages.append(
-                        ToolMessage(
-                            content=content_str,
-                            tool_call_id=fr.name,  # ADK uses tool name as ID
-                            name=fr.name,
-                        )
+                        ToolMessage(content=content_str, tool_call_id=fr.name, name=fr.name)
                     )
             else:
                 text = "\n".join(p.text for p in text_parts if p.text)
@@ -222,66 +263,56 @@ def _adk_contents_to_langchain(
                     messages.append(HumanMessage(content=text))
 
         elif role == "model":
-            text = "\n".join(p.text for p in text_parts if p.text)
-            tool_calls = []
-            for p in fn_calls:
-                fc = p.function_call
-                tool_calls.append(
-                    {
-                        "name": fc.name,
-                        "args": dict(fc.args) if fc.args else {},
-                        "id": fc.name,
-                        "type": "tool_call",
-                    }
-                )
+            text       = "\n".join(p.text for p in text_parts if p.text)
+            tool_calls = [
+                {
+                    "name": p.function_call.name,
+                    "args": dict(p.function_call.args) if p.function_call.args else {},
+                    "id":   p.function_call.name,
+                    "type": "tool_call",
+                }
+                for p in fn_calls
+            ]
             messages.append(AIMessage(content=text, tool_calls=tool_calls))
 
     return messages
 
 
 def _langchain_to_adk_response(lc_output: Any) -> LlmResponse:
-    """
-    Convert a LangChain response (AIMessage, str, or other) to LlmResponse.
-    Handles both native tool_calls (BaseChatModel) and plain text (LLM).
-    """
+    """Convert a LangChain response (AIMessage / str / other) to LlmResponse."""
     parts: list[types.Part] = []
 
-    # ── Case 1: AIMessage (from BaseChatModel) ─────────────────
     if isinstance(lc_output, AIMessage):
-        # Text content
-        raw_content = lc_output.content
-        if isinstance(raw_content, str) and raw_content:
-            # Check if the text itself encodes a tool call (plain LLM fallback)
-            maybe_tc = _parse_tool_call_from_text(raw_content)
+        raw = lc_output.content
+
+        # ── text ────────────────────────────────────────────────
+        if isinstance(raw, str) and raw:
+            maybe_tc = _parse_tool_call_from_text(raw)
             if maybe_tc:
                 name, args = maybe_tc
                 parts.append(
-                    types.Part(
-                        function_call=types.FunctionCall(name=name, args=args)
-                    )
+                    types.Part(function_call=types.FunctionCall(name=name, args=args))
                 )
             else:
-                parts.append(types.Part(text=raw_content))
-        elif isinstance(raw_content, list):
-            for item in raw_content:
+                parts.append(types.Part(text=raw))
+        elif isinstance(raw, list):
+            for item in raw:
                 if isinstance(item, str) and item:
                     parts.append(types.Part(text=item))
                 elif isinstance(item, dict) and item.get("type") == "text":
                     parts.append(types.Part(text=item.get("text", "")))
 
-        # Native tool_calls (BaseChatModel with bind_tools)
-        if lc_output.tool_calls:
-            for tc in lc_output.tool_calls:
-                parts.append(
-                    types.Part(
-                        function_call=types.FunctionCall(
-                            name=tc["name"],
-                            args=tc.get("args", {}),
-                        )
+        # ── native tool_calls ────────────────────────────────────
+        for tc in (lc_output.tool_calls or []):
+            parts.append(
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name=tc["name"], args=tc.get("args", {})
                     )
                 )
+            )
 
-        # Legacy additional_kwargs function_call
+        # ── legacy additional_kwargs function_call ───────────────
         if not lc_output.tool_calls:
             fc_kw = (lc_output.additional_kwargs or {}).get("function_call")
             if fc_kw:
@@ -297,20 +328,14 @@ def _langchain_to_adk_response(lc_output: Any) -> LlmResponse:
                     )
                 )
 
-    # ── Case 2: plain string (from LLM.invoke / LLM.ainvoke) ──
     elif isinstance(lc_output, str):
         maybe_tc = _parse_tool_call_from_text(lc_output)
         if maybe_tc:
             name, args = maybe_tc
-            parts.append(
-                types.Part(
-                    function_call=types.FunctionCall(name=name, args=args)
-                )
-            )
+            parts.append(types.Part(function_call=types.FunctionCall(name=name, args=args)))
         else:
             parts.append(types.Part(text=lc_output))
 
-    # ── Fallback ───────────────────────────────────────────────
     else:
         parts.append(types.Part(text=str(lc_output)))
 
@@ -321,48 +346,72 @@ def _langchain_to_adk_response(lc_output: Any) -> LlmResponse:
 
 
 # ─────────────────────────────────────────────────────────────
+# Low-level async/sync LLM caller (no bind_tools)
+# ─────────────────────────────────────────────────────────────
+async def _call_llm(llm: Any, messages: list[BaseMessage], **invoke_kwargs) -> Any:
+    """
+    Call llm.ainvoke or llm.invoke (sync wrapped in executor).
+    Extra kwargs (e.g. tools=[...]) are forwarded to the LLM.
+    """
+    if hasattr(llm, "ainvoke"):
+        return await llm.ainvoke(messages, **invoke_kwargs)
+    else:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: llm.invoke(messages, **invoke_kwargs)
+        )
+
+
+# ─────────────────────────────────────────────────────────────
 # Main bridge class
 # ─────────────────────────────────────────────────────────────
 class LangChainADKBridge(BaseLlm):
     """
     Wraps any LangChain LLM or BaseChatModel as a Google ADK BaseLlm.
 
-    Usage
-    -----
-    from custom_llm.adk_langchain_bridge import LangChainADKBridge
-    from my_module import MyCustomLLM          # your LangChain LLM
+    Key design decisions
+    ────────────────────
+    • We NEVER call bind_tools() — it raises NotImplementedError on most custom LLMs.
+    • Tool calling strategy (tried in order):
+        1. Pass tools as ``tools=[...]`` kwarg directly to ainvoke/invoke.
+           Your ``_generate`` method receives them in **kwargs.
+           If this raises an exception, we fall back automatically.
+        2. Inject tool descriptions into the system prompt and parse JSON
+           function-call blocks from the text output.
+    • Full Python tracebacks are logged (and included in LlmResponse.error_message)
+      so you can see exactly what went wrong.
 
-    bridge = LangChainADKBridge(
-        langchain_llm=MyCustomLLM(...),
-        model="my-custom-llm",                # display name only
-    )
+    Quick usage
+    ───────────
+        from custom_llm.adk_langchain_bridge import LangChainADKBridge
+        from my_module import MyCustomLLM
 
-    root_agent = Agent(model=bridge, ...)
+        bridge = LangChainADKBridge(
+            langchain_llm=MyCustomLLM(...),
+            model="my-custom-llm",
+        )
+        root_agent = Agent(model=bridge, ...)
 
-    Notes
-    -----
-    - If your LLM is a BaseChatModel with bind_tools support, tool calls are
-      handled natively.
-    - If your LLM is a plain LLM (text completion), tool call instructions are
-      injected into the system prompt and the output is parsed for JSON blocks.
+    Configuration
+    ─────────────
+    prefer_native_tools : bool (default True)
+        Try passing tools via kwargs before falling back to prompt injection.
+        Set to False to always use prompt injection (useful if your LLM does
+        not read extra kwargs or always errors on the tools param).
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # Required by BaseLlm (Pydantic field)
     model: str = "langchain-custom-llm"
-
-    # Your LangChain LLM instance — injected at construction time
     langchain_llm: Any
 
-    # ── Optional knobs ──────────────────────────────────────────
     prefer_native_tools: bool = True
     """
-    If True (default) and the LLM supports bind_tools, use native tool calling.
-    Set to False to force system-prompt-based tool injection for all LLMs.
+    Try native kwargs-based tool passing first.
+    Flip to False if your LLM ignores or errors on extra kwargs.
     """
 
-    # ── Internal helpers ────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────
     def _get_system_instruction(self, llm_request: LlmRequest) -> str:
         si = (llm_request.config or types.GenerateContentConfig()).system_instruction
         if isinstance(si, str):
@@ -371,70 +420,57 @@ class LangChainADKBridge(BaseLlm):
             return " ".join(p.text for p in (si.parts or []) if p.text)
         return ""
 
-    def _is_chat_model(self) -> bool:
-        """Return True if the wrapped LLM behaves like a BaseChatModel."""
-        try:
-            from langchain_core.language_models.chat_models import BaseChatModel
-            return isinstance(self.langchain_llm, BaseChatModel)
-        except ImportError:
-            return False
-
-    def _supports_bind_tools(self) -> bool:
-        return self.prefer_native_tools and hasattr(self.langchain_llm, "bind_tools")
-
-    async def _invoke_llm(self, messages: list[BaseMessage], lc_tools: list[dict]) -> Any:
-        """Invoke the LangChain LLM, using bind_tools when available."""
-        llm = self.langchain_llm
-        if lc_tools and self._supports_bind_tools():
-            llm = llm.bind_tools(lc_tools)
-
-        if hasattr(llm, "ainvoke"):
-            return await llm.ainvoke(messages)
-        else:
-            # Sync LLM — run in thread pool to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, llm.invoke, messages)
-
-    # ── Main ADK entry point ────────────────────────────────────
+    # ── Main ADK entry point ─────────────────────────────────────
     async def generate_content_async(
         self,
         llm_request: LlmRequest,
         stream: bool = False,
     ) -> AsyncGenerator[LlmResponse, None]:
-        """Translate between ADK and LangChain, then yield one LlmResponse."""
 
-        # 1. Gather system instruction
         system_inst = self._get_system_instruction(llm_request)
-
-        # 2. Extract tool declarations
-        decls = _extract_function_declarations(llm_request)
-
-        # 3. Decide tool strategy
-        use_native = self._supports_bind_tools()
-        tool_suffix = "" if use_native else _build_tool_system_suffix(decls)
-        lc_tools = decls if use_native else []
-
-        # 4. Convert contents → LangChain messages
-        messages = _adk_contents_to_langchain(
-            llm_request.contents, system_inst, tool_suffix
-        )
+        decls       = _extract_function_declarations(llm_request)
 
         logger.debug(
-            "[LangChainADKBridge] model=%s | msgs=%d | tools=%d | native=%s",
-            self.model, len(messages), len(decls), use_native,
+            "[LangChainADKBridge] model=%s | content_turns=%d | tools=%d",
+            self.model, len(llm_request.contents), len(decls),
         )
 
-        # 5. Invoke LLM
+        # ── Strategy 1: native kwargs tool passing ───────────────
+        if decls and self.prefer_native_tools:
+            messages    = _adk_contents_to_langchain(llm_request.contents, system_inst)
+            openai_tools = _to_openai_tools(decls)
+            try:
+                lc_resp = await _call_llm(self.langchain_llm, messages, tools=openai_tools)
+                yield _langchain_to_adk_response(lc_resp)
+                return
+            except (NotImplementedError, TypeError) as exc:
+                logger.warning(
+                    "[LangChainADKBridge] Native tools kwarg not supported (%s). "
+                    "Falling back to prompt injection.", exc
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[LangChainADKBridge] Native tool calling raised %s: %s. "
+                    "Falling back to prompt injection.\n%s",
+                    type(exc).__name__, exc, tb_module.format_exc(),
+                )
+
+        # ── Strategy 2: system-prompt tool injection ─────────────
+        tool_suffix = _build_tool_system_suffix(decls) if decls else ""
+        messages    = _adk_contents_to_langchain(llm_request.contents, system_inst, tool_suffix)
         try:
-            lc_response = await self._invoke_llm(messages, lc_tools)
+            lc_resp = await _call_llm(self.langchain_llm, messages)
+            yield _langchain_to_adk_response(lc_resp)
         except Exception as exc:
-            logger.error("[LangChainADKBridge] LLM invocation failed: %s", exc)
+            full_tb = tb_module.format_exc()
+            logger.error(
+                "[LangChainADKBridge] LLM invocation failed:\n%s", full_tb
+            )
+            # Surface the real error to the ADK caller
             yield LlmResponse(
                 error_code="LLM_INVOCATION_ERROR",
-                error_message=str(exc),
+                error_message=(
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    f"--- Full traceback ---\n{full_tb}"
+                ),
             )
-            return
-
-        # 6. Convert response → ADK LlmResponse
-        adk_response = _langchain_to_adk_response(lc_response)
-        yield adk_response
