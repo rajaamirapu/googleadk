@@ -1,0 +1,8 @@
+# Google Agent Development Kit
+google-adk>=1.0.0
+
+# LiteLLM — bridges ADK to Ollama (and other providers)
+litellm>=1.40.0
+
+# HTTP client for weather & sunrise/sunset APIs
+requests>=2.31.0
