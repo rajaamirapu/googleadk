@@ -1,47 +1,90 @@
 """
-Weather & Sunrise/Sunset Agent — powered by Google ADK + Ollama (via LiteLLM).
+Weather & Sunrise/Sunset Agent — powered by Google ADK + Custom LangChain LLM.
 
-Usage:
-    # Interactive web UI
+How to use
+──────────
+# Interactive web UI
     adk web weather_sunrise_agent
 
-    # Single-turn CLI
+# Single-turn CLI
     adk run weather_sunrise_agent
 
-Make sure Ollama is running locally (default: http://localhost:11434)
-and the desired model is pulled, e.g.:
-    ollama pull llama3.2
+# Programmatic
+    python demo.py
+
+Swapping the LLM
+────────────────
+Edit the "LLM CONFIGURATION" section below to point at YOUR LangChain LLM.
+
+Three options are pre-wired (uncomment the one you want):
+
+  Option A — CustomChatLLM  (BaseChatModel, OpenAI-compatible endpoint)
+  Option B — CustomTextLLM  (plain LLM, text completion endpoint)
+  Option C — Drop in YOUR OWN LangChain LLM class directly
 """
 
 import os
 from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
 
+# ─────────────────────────────────────────────────────────────
+# LangChain → ADK bridge
+# ─────────────────────────────────────────────────────────────
+from custom_llm.adk_langchain_bridge import LangChainADKBridge
+from custom_llm.base_custom_llm import CustomChatLLM, CustomTextLLM
+
+# ─────────────────────────────────────────────────────────────
+# Agent tools
+# ─────────────────────────────────────────────────────────────
 from weather_sunrise_agent.tools import get_weather, get_sunrise_sunset, get_full_report
 
-# ─────────────────────────────────────────────────────────────
-# Ollama model configuration
-#
-# Change OLLAMA_MODEL to any model you have pulled locally, e.g.:
-#   llama3.2  |  llama3.1  |  gemma3  |  mistral  |  phi4
-#
-# IMPORTANT: Use the "ollama_chat/" prefix (not plain "ollama/")
-#            to avoid tool-call loop issues.
-# ─────────────────────────────────────────────────────────────
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-ollama_llm = LiteLlm(
-    model=f"ollama_chat/{OLLAMA_MODEL}",
-    api_base=OLLAMA_BASE_URL,
+# ═════════════════════════════════════════════════════════════
+# LLM CONFIGURATION  — edit this section
+# ═════════════════════════════════════════════════════════════
+
+# ── Option A: CustomChatLLM (BaseChatModel, recommended) ─────
+#    Uses any OpenAI-compatible chat endpoint (Ollama, vLLM, LM Studio, etc.)
+_base_url  = os.getenv("CUSTOM_LLM_BASE_URL",  "http://localhost:11434/v1")
+_model     = os.getenv("CUSTOM_LLM_MODEL",     "llama3.2")
+_api_key   = os.getenv("CUSTOM_LLM_API_KEY",   "custom")
+
+langchain_llm = CustomChatLLM(
+    base_url=_base_url,
+    model_name=_model,
+    api_key=_api_key,
+    temperature=0.3,    # lower = more deterministic tool calls
+    max_tokens=2048,
 )
+
+# ── Option B: CustomTextLLM (plain LLM) ──────────────────────
+#    Uncomment and comment out Option A above to switch.
+# langchain_llm = CustomTextLLM(
+#     base_url=os.getenv("CUSTOM_LLM_BASE_URL", "http://localhost:11434"),
+#     model_name=os.getenv("CUSTOM_LLM_MODEL", "llama3.2"),
+# )
+
+# ── Option C: YOUR OWN LangChain LLM ─────────────────────────
+#    Just replace `langchain_llm` with your own instance:
+#
+#    from my_module import MyCustomLLM
+#    langchain_llm = MyCustomLLM(...)
+
+
+# ─────────────────────────────────────────────────────────────
+# Wrap the LangChain LLM for Google ADK
+# ─────────────────────────────────────────────────────────────
+adk_llm = LangChainADKBridge(
+    langchain_llm=langchain_llm,
+    model=f"custom/{_model}",   # display name shown in ADK web UI
+)
+
 
 # ─────────────────────────────────────────────────────────────
 # Agent definition
 # ─────────────────────────────────────────────────────────────
 root_agent = Agent(
     name="weather_sunrise_agent",
-    model=ollama_llm,
+    model=adk_llm,
     description=(
         "A helpful assistant that provides real-time weather conditions, "
         "sunrise, and sunset times for any location given latitude and longitude."

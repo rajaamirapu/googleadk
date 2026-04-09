@@ -1,8 +1,14 @@
 # Google Agent Development Kit
 google-adk>=1.0.0
 
-# LiteLLM — bridges ADK to Ollama (and other providers)
-litellm>=1.40.0
+# LangChain core (base classes for custom LLMs)
+langchain-core>=0.2.0
 
-# HTTP client for weather & sunrise/sunset APIs
+# HTTP client used by the example CustomChatLLM / CustomTextLLM
 requests>=2.31.0
+
+# Weather & sunrise/sunset API calls (also uses requests)
+# (already covered above)
+
+# Optional: load .env files in demo.py
+python-dotenv>=1.0.0
