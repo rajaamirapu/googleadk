@@ -1,21 +1,49 @@
 # 🌤️ Weather & Sunrise/Sunset Agent
 
-A **Google ADK** agent that provides real-time weather conditions, sunrise, and sunset times for any location — using **Ollama** as the local LLM backend (no OpenAI or Google API keys needed).
+A **Google ADK** agent that provides real-time weather conditions, sunrise, and sunset times for any location — using a **custom LangChain LLM** as the backend.
 
 ---
 
 ## 🏗️ Project Structure
 
 ```
-googleadk/
-├── weather_sunrise_agent/
-│   ├── __init__.py       # Exports root_agent (required by ADK)
-│   ├── agent.py          # Agent definition + Ollama LLM config
-│   └── tools.py          # Tool functions (weather, sunrise/sunset)
-├── demo.py               # Programmatic demo (no web UI)
+googleadk/                          ← AGENTS_DIR (run adk web from here)
+├── weather_sunrise_agent/          ← Agent package
+│   ├── __init__.py                 # Exports root_agent (required by ADK)
+│   ├── agent.py                    # Agent + custom LLM wiring
+│   └── tools.py                    # Tool functions (weather, sunrise/sunset)
+├── custom_llm/                     ← LangChain → ADK bridge
+│   ├── __init__.py
+│   ├── adk_langchain_bridge.py     # Core bridge (LangChain LLM → ADK BaseLlm)
+│   └── base_custom_llm.py         # Example LLM implementations
+├── launch.sh                       # ✅ Correct way to start the web UI
+├── demo.py                         # Programmatic demo (no web UI)
+├── debug_connection.py             # Diagnose LLM connection issues
 ├── requirements.txt
-├── .env.example          # Copy to .env and configure
+├── .env                            # Auto-loaded by ADK at startup
+├── .env.example
 └── README.md
+```
+
+---
+
+## ⚠️ Critical: How to Run `adk web` Correctly
+
+**`adk web` takes a directory that CONTAINS agent packages — not the agent name itself.**
+
+```bash
+# ✅ CORRECT — run from inside googleadk/ (or pass it as the path)
+cd path/to/googleadk
+adk web .
+
+# ✅ Also correct — use the launch script
+./launch.sh
+
+# ✅ Also correct — full path
+adk web path/to/googleadk
+
+# ❌ WRONG — this makes ADK look inside weather_sunrise_agent/ for more agents
+adk web weather_sunrise_agent
 ```
 
 ---
@@ -25,21 +53,19 @@ googleadk/
 | Requirement | Details |
 |---|---|
 | Python | 3.10+ |
-| [Ollama](https://ollama.com/) | Running locally on port 11434 |
-| Ollama model | e.g. `llama3.2`, `gemma3`, `mistral` |
+| Custom LLM server | Any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio…) |
+| LLM model | Must be running and accessible |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Install Ollama & pull a model
+### 1. Start your LLM server
 
 ```bash
-# Install Ollama from https://ollama.com/download
-# Then pull a model (pick one that fits your hardware):
-ollama pull llama3.2       # ~2GB — fast, good for tool calling
-ollama pull gemma3         # Google's open model
-ollama pull mistral        # Mistral 7B
+# Example with Ollama:
+ollama serve
+ollama pull llama3.2
 ```
 
 ### 2. Install Python dependencies
@@ -48,23 +74,32 @@ ollama pull mistral        # Mistral 7B
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
+### 3. Configure `.env`
 
-```bash
-cp .env.example .env
-# Edit .env to set OLLAMA_MODEL to your pulled model name
+Edit `.env` (already created with defaults) — set your LLM endpoint:
+
+```env
+CUSTOM_LLM_BASE_URL=http://localhost:11434/v1
+CUSTOM_LLM_MODEL=llama3.2
+CUSTOM_LLM_API_KEY=custom
 ```
 
 ### 4a. Run with the ADK Web UI (recommended)
 
 ```bash
-adk web weather_sunrise_agent
+# From inside the googleadk/ directory:
+cd path/to/googleadk
+adk web .
 # Open http://localhost:8000 in your browser
+
+# Or use the included script (handles the cd automatically):
+./launch.sh
 ```
 
 ### 4b. Run with the ADK CLI
 
 ```bash
+cd path/to/googleadk
 adk run weather_sunrise_agent
 ```
 
