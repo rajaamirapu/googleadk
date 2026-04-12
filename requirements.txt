@@ -4,11 +4,20 @@ google-adk>=1.0.0
 # LangChain core (base classes for custom LLMs)
 langchain-core>=0.2.0
 
-# HTTP client used by the example CustomChatLLM / CustomTextLLM
+# HTTP client
 requests>=2.31.0
 
-# Weather & sunrise/sunset API calls (also uses requests)
-# (already covered above)
+# ── Mutual Fund Planner dependencies ──────────────────────────────────────
 
-# Optional: load .env files in demo.py
+# AMFI official mutual fund data (NAV, scheme codes)
+mftool>=2.2.0
+
+# YouTube transcript extraction (CNBC, ET Now, etc.)
+youtube-transcript-api>=0.6.0
+
+# HTML parsing for Moneycontrol / ET / LiveMint scraping
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Env file loading
 python-dotenv>=1.0.0
